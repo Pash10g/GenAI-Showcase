@@ -13,7 +13,7 @@ dotenv_path = os.path.join(os.path.dirname(__file__), '.env')
 load_dotenv(dotenv_path=dotenv_path)
 
 # --- MongoDB Configuration ---
-MONGO_DETAILS = os.getenv("MONGODB_URI", "mongodb+srv://admin:admin123@80cluster.u9i2v.mongodb.net/cline")
+MONGO_DETAILS = os.getenv("MONGODB_URI")
 DATABASE_NAME = "scheduling_db_fastmcp" # Using a different DB name to avoid conflicts
 MEETINGS_COLLECTION = "meeting_slots"
 
