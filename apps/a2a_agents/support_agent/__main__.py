@@ -1,6 +1,14 @@
 import logging
 import os
 
+import sys
+from pathlib import Path
+
+# Add the project root to the Python path
+# This allows for absolute imports, making the script runnable from any location
+project_root = Path(__file__).resolve().parents[3]
+sys.path.insert(0, str(project_root))
+
 import click
 import uvicorn
 
@@ -12,8 +20,8 @@ from google.adk.memory.in_memory_memory_service import InMemoryMemoryService
 from google.adk.runners import Runner
 from google.adk.sessions import InMemorySessionService
 from starlette.routing import Route
-from mongodb_session_service import MongoDBSessionService
-from mongodb_memory_service import MongoDBMemoryService
+from apps.a2a_agents.mongodb.mongodb_session_service import MongoDBSessionService
+from apps.a2a_agents.mongodb.mongodb_memory_service import MongoDBMemoryService
 from a2a.server.apps import A2AStarletteApplication
 from a2a.server.request_handlers import DefaultRequestHandler
 from a2a.server.tasks import InMemoryTaskStore

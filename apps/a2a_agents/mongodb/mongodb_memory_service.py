@@ -17,6 +17,8 @@ from __future__ import annotations
 import os
 import re
 import logging
+import certifi
+import vertexai
 from datetime import datetime, timezone
 from typing import TYPE_CHECKING, Dict, List, Any, Optional
 
@@ -24,6 +26,7 @@ from typing_extensions import override
 from pymongo import MongoClient
 from pymongo.collection import Collection
 from bson import ObjectId
+from vertexai.language_models import TextEmbeddingModel
 
 from google.adk.memory.base_memory_service import BaseMemoryService
 from google.adk.memory.base_memory_service import SearchMemoryResponse
@@ -54,34 +57,43 @@ class MongoDBMemoryService(BaseMemoryService):
     """
 
     def __init__(
-        self, 
-        mongodb_uri: str = None, 
+        self,
+        mongodb_uri: str = None,
         database_name: str = "adk_agent_memory",
         similarity_top_k: int = 10,
-        vector_distance_threshold: float = 0.5
+        vector_similarity_threshold: float = 0.5,
+        vector_index_name: str = "vector_index",
+        embedding_dimensions: int = 768,
     ):
         """
         Initializes a MongoDBMemoryService.
-        
         Args:
             mongodb_uri: MongoDB connection string. If None, uses MONGODB_URI env var.
             database_name: Name of the database to use for storage.
             similarity_top_k: The number of contexts to retrieve during search.
-            vector_distance_threshold: Threshold for similarity matching (0.0-1.0).
+            vector_similarity_threshold: Threshold for similarity matching (0.0-1.0).
+            vector_index_name: The name of the vector search index in MongoDB.
+            embedding_dimensions: The dimensionality of the embeddings.
         """
         self.mongodb_uri = mongodb_uri or os.getenv("MONGODB_URI")
         if not self.mongodb_uri:
             raise ValueError(
                 "MongoDB URI must be provided or set in MONGODB_URI environment variable"
             )
-        
+
         self.database_name = database_name
         self.similarity_top_k = similarity_top_k
-        self.vector_distance_threshold = vector_distance_threshold
-        
+        self.vector_similarity_threshold = vector_similarity_threshold
+        self.vector_index_name = vector_index_name
+        self.embedding_dimensions = embedding_dimensions
+
         # Initialize MongoDB connection
-        self.client = MongoClient(self.mongodb_uri)
+        self.client = MongoClient(self.mongodb_uri, tlsCAFile=certifi.where())
         self.db = self.client[database_name]
+
+        # Initialize Vertex AI
+        vertexai.init()
+        self.embedding_model = TextEmbeddingModel.from_pretrained("text-embedding-004")
         
         # Collections
         self.session_events: Collection = self.db.session_events
@@ -99,16 +111,41 @@ class MongoDBMemoryService(BaseMemoryService):
             self.session_events.create_index([("user_key", 1), ("session_id", 1)])
             self.session_events.create_index([("app_name", 1), ("user_id", 1)])
             self.session_events.create_index([("timestamp", -1)])
-            
+
             # Memory entries indexes for search
             self.memory_entries.create_index([("user_key", 1)])
             self.memory_entries.create_index([("app_name", 1), ("user_id", 1)])
             self.memory_entries.create_index([("timestamp", -1)])
-            self.memory_entries.create_index([("keywords", 1)])  # For keyword search
-            
+
+            self._create_vector_search_index()
+
             logger.info("MongoDB indexes created successfully")
         except Exception as e:
             logger.warning(f"Error creating indexes: {e}")
+
+    def _create_vector_search_index(self):
+        """Creates the vector search index if it doesn't exist."""
+        try:
+            # Define the vector search index
+            index_model = {
+    "name": self.vector_index_name,
+    "type": "vectorSearch",
+    "definition": {
+        "fields": [
+            {
+                "type": "vector",
+                "path": "embedding",
+                "numDimensions": self.embedding_dimensions,
+                "similarity": "cosine",
+            }
+        ]
+    },
+}
+            
+            self.memory_entries.create_search_index(model=index_model)
+            
+        except Exception as e:
+            logger.error(f"Error creating vector search index: {e}")
 
     @override
     async def add_session_to_memory(self, session: Session):
@@ -163,9 +200,9 @@ class MongoDBMemoryService(BaseMemoryService):
             ])
             
             if text_content:
-                # Extract keywords for search
-                keywords = list(_extract_words_lower(text_content))
-                
+                # Generate embedding for the text content
+                embedding = self._generate_embeddings(text_content)
+
                 memory_entry = {
                     "user_key": user_key,
                     "app_name": session.app_name,
@@ -175,8 +212,8 @@ class MongoDBMemoryService(BaseMemoryService):
                     "author": event.author,
                     "timestamp": datetime.now(timezone.utc),
                     "text_content": text_content,
-                    "keywords": keywords,
-                    "event_timestamp": event.timestamp.isoformat() if event.timestamp else None
+                    "embedding": embedding,
+                    "event_timestamp": event.timestamp.isoformat() if event.timestamp else None,
                 }
                 memory_entries.append(memory_entry)
         
@@ -210,100 +247,102 @@ class MongoDBMemoryService(BaseMemoryService):
         self, *, app_name: str, user_id: str, query: str
     ) -> SearchMemoryResponse:
         """
-        Searches for sessions that match the query using keyword matching.
-        
+        Searches for sessions that match the query using vector-based semantic search.
         Args:
             app_name: The application name to search within.
             user_id: The user ID to search for.
             query: The search query string.
-            
         Returns:
             SearchMemoryResponse containing matching memory entries.
         """
         user_key = _user_key(app_name, user_id)
-        
-        # Extract query words
-        query_words = set(query.lower().split())
-        if not query_words:
+
+        if not query:
             return SearchMemoryResponse()
-        
+
         try:
-            # Search using MongoDB query
-            # Use regex for partial word matching and keyword array search
-            search_conditions = []
-            
-            # Search in keywords array
-            for word in query_words:
-                search_conditions.append({"keywords": {"$regex": word, "$options": "i"}})
-            
-            # Also search in full text content
-            search_conditions.append({
-                "text_content": {"$regex": "|".join(query_words), "$options": "i"}
-            })
-            
-            # Build the final query
-            mongo_query = {
-                "user_key": user_key,
-                "$or": search_conditions
-            }
-            
-            # Execute search with limit
-            cursor = self.memory_entries.find(mongo_query).sort("timestamp", -1)
-            
-            if self.similarity_top_k:
-                cursor = cursor.limit(self.similarity_top_k)
-            
+            # Generate embedding for the query
+            query_embedding = self._generate_embeddings(query)
+
+            # Define the aggregation pipeline for vector search
+            pipeline = [
+                {
+                    "$vectorSearch": {
+                        "index": self.vector_index_name,
+                        "path": "embedding",
+                        "queryVector": query_embedding,
+                        "numCandidates": self.similarity_top_k * 10,  # Oversample for better accuracy
+                        "limit": self.similarity_top_k,
+                    }
+                },
+                {
+                    "$project": {
+                        "_id": 1,
+                        "content": 1,
+                        "author": 1,
+                        "timestamp": 1,
+                        "event_timestamp": 1,
+                        "score": {"$meta": "vectorSearchScore"},
+                    }
+                },
+            ]
+
+            # Execute the aggregation pipeline
+            cursor = self.memory_entries.aggregate(pipeline)
             results = list(cursor)
-            
+
             # Convert results to MemoryEntry objects
             response = SearchMemoryResponse()
-            
+
             for result in results:
-                # Calculate simple similarity score based on keyword overlap
-                result_keywords = set(result.get("keywords", []))
-                overlap = len(query_words.intersection(result_keywords))
-                similarity_score = overlap / len(query_words) if query_words else 0
-                
-                # Apply distance threshold (convert to distance: 1 - similarity)
-                distance = 1.0 - similarity_score
-                if distance <= self.vector_distance_threshold:
+                # Check if the similarity score meets the threshold
+                if result["score"] >= self.vector_similarity_threshold:
                     memory_entry = MemoryEntry(
                         content=self._deserialize_content(result["content"]),
                         author=result["author"],
-                        timestamp=result.get("event_timestamp") or 
-                                 result["timestamp"].isoformat()
+                        timestamp=result.get("event_timestamp")
+                        or result["timestamp"].isoformat(),
                     )
                     response.memories.append(memory_entry)
-            
+
             logger.info(
                 f"Found {len(response.memories)} memory entries for query '{query}' "
                 f"for user {user_key}"
             )
-            
+
             return response
-            
+
         except Exception as e:
             logger.error(f"Error searching memory: {e}")
             return SearchMemoryResponse()
+
+    def _generate_embeddings(self, text: str) -> list[float]:
+        """Generates embeddings for a given text."""
+        try:
+            result = self.embedding_model.get_embeddings([text])
+            return result[0].values
+        except Exception as e:
+            logger.error(f"Error generating embeddings: {e}")
+            return []
 
     def _serialize_content(self, content) -> Dict[str, Any]:
         """Serialize content object to dictionary for MongoDB storage."""
         if not content:
             return {}
-        
+
         serialized = {}
-        if hasattr(content, 'parts') and content.parts:
-            serialized['parts'] = []
+        if hasattr(content, "parts") and content.parts:
+            serialized["parts"] = []
             for part in content.parts:
                 part_data = {}
-                if hasattr(part, 'text') and part.text:
-                    part_data['text'] = part.text
-                if hasattr(part, 'function_call') and part.function_call:
-                    part_data['function_call'] = str(part.function_call)
-                if hasattr(part, 'function_response') and part.function_response:
-                    part_data['function_response'] = str(part.function_response)
-                serialized['parts'].append(part_data)
-        
+                if hasattr(part, "text") and part.text:
+                    part_data["text"] = part.text
+                if hasattr(part, "function_call") and part.function_call:
+                    part_data["function_call"] = str(part.function_call)
+                if hasattr(part, "function_response") and part.function_response:
+                    part_data["function_response"] = str(part.function_response)
+                serialized["parts"].append(part_data)
+
         return serialized
 
     def _deserialize_content(self, content_dict: Dict[str, Any]):
@@ -338,17 +377,19 @@ def create_mongodb_memory_service(
     mongodb_uri: str = None,
     database_name: str = "adk_agent_memory",
     similarity_top_k: int = 10,
-    vector_distance_threshold: float = 0.5
+    vector_similarity_threshold: float = 0.5,
+    vector_index_name: str = "vector_index",
+    embedding_dimensions: int = 768,
 ) -> MongoDBMemoryService:
     """
     Create a MongoDB memory service instance.
-    
     Args:
         mongodb_uri: MongoDB connection string
         database_name: Database name to use
         similarity_top_k: Number of results to return
-        vector_distance_threshold: Similarity threshold
-        
+        vector_similarity_threshold: Similarity threshold
+        vector_index_name: The name of the vector search index in MongoDB.
+        embedding_dimensions: The dimensionality of the embeddings.
     Returns:
         MongoDBMemoryService instance
     """
@@ -356,5 +397,7 @@ def create_mongodb_memory_service(
         mongodb_uri=mongodb_uri,
         database_name=database_name,
         similarity_top_k=similarity_top_k,
-        vector_distance_threshold=vector_distance_threshold
+        vector_similarity_threshold=vector_similarity_threshold,
+        vector_index_name=vector_index_name,
+        embedding_dimensions=embedding_dimensions,
     )

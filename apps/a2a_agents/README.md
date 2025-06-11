@@ -1,5 +1,10 @@
 # A2A MCP App - Agent Architecture and MongoDB Integration
 
+> ### This repo is built on top of Google's a2a code example.
+> Code origin: https://github.com/google-a2a/a2a-samples/tree/main/samples/a2a-adk-app
+>
+
+
 This project demonstrates an Agent-to-Agent (A2A) communication setup involving a routing agent, a support/scheduling agent, and a dedicated MCP server for managing meeting schedules. MongoDB plays a crucial role in this architecture, serving both as a persistent data store for the scheduling MCP and as a backend for agent memory and session management.
 
 ## Agent Interaction Flow
@@ -151,5 +156,6 @@ uv run app.py
 
 When the app.py is up you can access it via http://0.0.0.0:8083/ 
 
+![A2A-example](./A2A-example.png)
 
 This dual use of MongoDB – as a transactional data store for the scheduling tools and as a flexible memory backend for the conversational agents – allows for a robust and stateful A2A system.

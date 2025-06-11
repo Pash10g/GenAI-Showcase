@@ -4,15 +4,21 @@ import os
 import click
 import uvicorn
 
+import sys
+from pathlib import Path
+
+project_root = Path(__file__).resolve().parents[3]
+sys.path.insert(0, str(project_root))
+
+
 from adk_agent import create_agent
 from adk_agent_executor import ADKAgentExecutor
 from dotenv import load_dotenv
 from google.adk.artifacts import InMemoryArtifactService
-from google.adk.memory.in_memory_memory_service import InMemoryMemoryService
+from apps.a2a_agents.mongodb.mongodb_memory_service import MongoDBMemoryService
 from google.adk.runners import Runner
-from google.adk.sessions import InMemorySessionService
 from starlette.routing import Route
-from mongodb_session_service import MongoDBSessionService
+from apps.a2a_agents.mongodb.mongodb_session_service import MongoDBSessionService
 from a2a.server.apps import A2AStarletteApplication
 from a2a.server.request_handlers import DefaultRequestHandler
 from a2a.server.tasks import InMemoryTaskStore
@@ -68,7 +74,7 @@ def main(host: str, port: int):
         agent=adk_agent,
         artifact_service=InMemoryArtifactService(),
         session_service=MongoDBSessionService(database_name="agent_memory"),
-        memory_service=InMemoryMemoryService(),
+        memory_service=MongoDBMemoryService(database_name="agent_memory")
     )
     agent_executor = ADKAgentExecutor(runner, agent_card)
 
